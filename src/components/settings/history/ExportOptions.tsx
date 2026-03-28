@@ -29,7 +29,9 @@ export const ExportOptions: React.FC<ExportOptionsProps> = ({ entry }) => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    // Delay revocation to ensure the download starts before the URL is freed.
+    // Revoking synchronously can race with the download on some WebView engines.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const exportToTxt = () => {
