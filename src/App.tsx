@@ -21,6 +21,23 @@ import { getLanguageDirection, initializeRTL } from "@/lib/utils/rtl";
 
 type OnboardingStep = "accessibility" | "model" | "done";
 
+const SUPPORTED_AUDIO_EXTENSIONS = [
+  "mp3",
+  "m4a",
+  "wav",
+  "ogg",
+  "flac",
+  "aac",
+  "wma",
+  "aiff",
+];
+
+const getErrorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+const isImportCancelledError = (error: unknown): boolean =>
+  getErrorMessage(error).toLowerCase().includes("cancel");
+
 const renderSettingsContent = (section: SidebarSection) => {
   const ActiveComponent =
     SECTIONS_CONFIG[section]?.component || SECTIONS_CONFIG.general.component;
@@ -150,20 +167,21 @@ function App() {
     let lastDropTimestamp = 0;
     const DROP_DEBOUNCE_MS = 3000;
 
-    const SUPPORTED_AUDIO_EXTENSIONS = [
-      "mp3", "m4a", "wav", "ogg", "flac", "aac", "wma", "aiff",
-    ];
-
     const isAudioFile = (filePath: string): boolean => {
       const lower = filePath.toLowerCase();
-      return SUPPORTED_AUDIO_EXTENSIONS.some((ext) => lower.endsWith(`.${ext}`));
+      return SUPPORTED_AUDIO_EXTENSIONS.some((ext) =>
+        lower.endsWith(`.${ext}`),
+      );
     };
 
     const showOverlay = () => {
       setIsDragActive(true);
       // Safety: auto-hide after 3s in case leave/drop never fires
       if (dragOverlayTimeout.current) clearTimeout(dragOverlayTimeout.current);
-      dragOverlayTimeout.current = setTimeout(() => setIsDragActive(false), 3000);
+      dragOverlayTimeout.current = setTimeout(
+        () => setIsDragActive(false),
+        3000,
+      );
     };
 
     const hideOverlay = () => {
@@ -221,8 +239,12 @@ function App() {
               return;
             }
 
-            const audioPaths = paths.filter((path: string) => isAudioFile(path));
-            const nonAudioPaths = paths.filter((path: string) => !isAudioFile(path));
+            const audioPaths = paths.filter((path: string) =>
+              isAudioFile(path),
+            );
+            const nonAudioPaths = paths.filter(
+              (path: string) => !isAudioFile(path),
+            );
 
             if (audioPaths.length === 0) {
               toast.error(t("settings.history.unsupportedFormat"));
@@ -254,7 +276,11 @@ function App() {
                   );
                 }
               } catch (error) {
-                toast.error(`${t("settings.history.importFailed")}: ${error}`);
+                if (!isImportCancelledError(error)) {
+                  toast.error(
+                    `${t("settings.history.importFailed")}: ${getErrorMessage(error)}`,
+                  );
+                }
               }
             }
           } finally {

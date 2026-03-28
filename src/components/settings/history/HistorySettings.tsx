@@ -1,8 +1,14 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
-import { readFile } from "@tauri-apps/plugin-fs";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { listen } from "@tauri-apps/api/event";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { readFile } from "@tauri-apps/plugin-fs";
 import {
   Check,
   Copy,
@@ -24,17 +30,23 @@ import {
   type HistoryEntry,
   type HistoryUpdatePayload,
 } from "@/bindings";
+import { useOsType } from "@/hooks/useOsType";
+import { formatDateTime } from "@/utils/dateFormat";
+import { AudioPlayer } from "../../ui/AudioPlayer";
+import { Button } from "../../ui/Button";
+import { ExportOptions } from "./ExportOptions";
 
 interface ImportProgress {
   stage: string;
   percent: number;
   message: string;
 }
-import { useOsType } from "@/hooks/useOsType";
-import { formatDateTime } from "@/utils/dateFormat";
-import { AudioPlayer } from "../../ui/AudioPlayer";
-import { Button } from "../../ui/Button";
-import { ExportOptions } from "./ExportOptions";
+
+const getErrorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+const isImportCancelledError = (error: unknown): boolean =>
+  getErrorMessage(error).toLowerCase().includes("cancel");
 
 const IconButton: React.FC<{
   onClick: () => void;
@@ -99,6 +111,9 @@ export const HistorySettings: React.FC = () => {
   // Import state
   const [isImporting, setIsImporting] = useState(false);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(
+    null,
+  );
+  const importResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
 
@@ -169,15 +184,40 @@ export const HistorySettings: React.FC = () => {
     return () => observer.disconnect();
   }, [loading, hasMore, loadPage]);
 
-  // Listen for history update events (from transcription pipeline AND import)
+  // Listen for history update events (from transcription pipeline and import).
   useEffect(() => {
     const unlisten = events.historyUpdatePayload.listen((event) => {
       const payload: HistoryUpdatePayload = event.payload;
+
       if (payload.action === "added") {
-        setEntries((prev) => [payload.entry, ...prev]);
-      } else if (payload.action === "updated") {
+        setEntries((prev) => [
+          payload.entry,
+          ...prev.filter((entry) => entry.id !== payload.entry.id),
+        ]);
+        return;
+      }
+
+      if (payload.action === "updated") {
         setEntries((prev) =>
-          prev.map((e) => (e.id === payload.entry.id ? payload.entry : e)),
+          prev.map((entry) =>
+            entry.id === payload.entry.id ? payload.entry : entry,
+          ),
+        );
+        return;
+      }
+
+      if (payload.action === "deleted") {
+        setEntries((prev) => prev.filter((entry) => entry.id !== payload.id));
+        return;
+      }
+
+      if (payload.action === "toggled") {
+        setEntries((prev) =>
+          prev.map((entry) =>
+            entry.id === payload.id
+              ? { ...entry, saved: payload.saved }
+              : entry,
+          ),
         );
       }
     });
@@ -196,19 +236,22 @@ export const HistorySettings: React.FC = () => {
           const progress = event.payload;
           setImportProgress(progress);
 
+          if (importResetTimeoutRef.current) {
+            clearTimeout(importResetTimeoutRef.current);
+            importResetTimeoutRef.current = null;
+          }
+
           if (
             progress.stage === "completed" ||
             progress.stage === "failed" ||
             progress.stage === "cancelled"
           ) {
-            // Clear import state after a short delay
-            setTimeout(() => {
+            importResetTimeoutRef.current = setTimeout(() => {
               setIsImporting(false);
               setImportProgress(null);
+              importResetTimeoutRef.current = null;
             }, 1500);
           } else {
-            // Any active progress means an import is running
-            // (could be from drag & drop, not just the button)
             setIsImporting(true);
           }
         },
@@ -220,26 +263,34 @@ export const HistorySettings: React.FC = () => {
     const unlistenPromise = setupListener();
 
     return () => {
+      if (importResetTimeoutRef.current) {
+        clearTimeout(importResetTimeoutRef.current);
+        importResetTimeoutRef.current = null;
+      }
       unlistenPromise.then((unlisten) => unlisten());
     };
   }, []);
 
   // Filter and search logic (client-side on loaded entries)
-  const filteredEntries = entries.filter((entry) => {
-    const matchesSearch =
-      searchQuery === "" ||
-      entry.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      entry.transcription_text
-        .toLowerCase()
-        .includes(searchQuery.toLowerCase());
+  const filteredEntries = useMemo(
+    () =>
+      entries.filter((entry) => {
+        const matchesSearch =
+          searchQuery === "" ||
+          entry.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          entry.transcription_text
+            .toLowerCase()
+            .includes(searchQuery.toLowerCase());
 
-    const matchesSource =
-      filterSource === "all" ||
-      (filterSource === "recording" && entry.source !== "upload") ||
-      (filterSource === "upload" && entry.source === "upload");
+        const matchesSource =
+          filterSource === "all" ||
+          (filterSource === "recording" && entry.source !== "upload") ||
+          (filterSource === "upload" && entry.source === "upload");
 
-    return matchesSearch && matchesSource;
-  });
+        return matchesSearch && matchesSource;
+      }),
+    [entries, filterSource, searchQuery],
+  );
 
   const toggleSaved = async (id: number) => {
     setEntries((prev) =>
@@ -278,11 +329,18 @@ export const HistorySettings: React.FC = () => {
             const blob = new Blob([fileData], { type: "audio/wav" });
             return URL.createObjectURL(blob);
           }
+
           return convertFileSrc(result.data, "asset");
         }
-        return null;
       } catch (error) {
-        console.error("Failed to get audio file path:", error);
+        console.warn("Falling back to data URL audio loading:", error);
+      }
+
+      try {
+        const fallback = await commands.getAudioFileData(fileName);
+        return fallback.status === "ok" ? fallback.data : null;
+      } catch (error) {
+        console.error("Failed to load audio file:", error);
         return null;
       }
     },
@@ -351,26 +409,34 @@ export const HistorySettings: React.FC = () => {
         ],
       });
 
-      if (selected) {
-        setIsImporting(true);
-        setImportProgress(null);
-        toast.info(t("settings.history.importing"));
-
-        const result = await commands.importAudioFile(selected as string);
-        if (result.status === "ok") {
-          toast.success(t("settings.history.importSuccess"));
-        } else {
-          toast.error(
-            `${t("settings.history.importFailed")}: ${result.error}`,
-          );
-        }
+      if (typeof selected !== "string") {
+        return;
       }
-    } catch (error) {
-      console.error("Failed to import audio:", error);
-      toast.error(`${t("settings.history.importFailed")}: ${error}`);
-    } finally {
+
+      setIsImporting(true);
+      setImportProgress(null);
+      toast.info(t("settings.history.importing"));
+
+      const result = await commands.importAudioFile(selected);
+      if (result.status === "ok") {
+        toast.success(t("settings.history.importSuccess"));
+        return;
+      }
+
       setIsImporting(false);
       setImportProgress(null);
+      toast.error(`${t("settings.history.importFailed")}: ${result.error}`);
+    } catch (error) {
+      if (isImportCancelledError(error)) {
+        return;
+      }
+
+      console.error("Failed to import audio:", error);
+      setIsImporting(false);
+      setImportProgress(null);
+      toast.error(
+        `${t("settings.history.importFailed")}: ${getErrorMessage(error)}`,
+      );
     }
   };
 
@@ -524,8 +590,15 @@ export const HistorySettings: React.FC = () => {
                   `❌ ${t("settings.history.importFailed")}`}
                 {importProgress.stage === "cancelled" &&
                   `🚫 ${t("settings.history.importCancelled")}`}
-                {!["decoding", "transcribing", "saving", "starting", "completed", "failed", "cancelled"].includes(importProgress.stage) &&
-                  importProgress.message}
+                {![
+                  "decoding",
+                  "transcribing",
+                  "saving",
+                  "starting",
+                  "completed",
+                  "failed",
+                  "cancelled",
+                ].includes(importProgress.stage) && importProgress.message}
               </span>
               <Button
                 onClick={handleCancelImport}

@@ -166,9 +166,8 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(history_manager.clone());
 
     // Import cancellation tokens
-    let import_cancellation_tokens = Arc::new(
-        crate::commands::import::ImportCancellationTokens::new(),
-    );
+    let import_cancellation_tokens =
+        Arc::new(crate::commands::import::ImportCancellationTokens::new());
     app_handle.manage(import_cancellation_tokens);
 
     // Note: Shortcuts are NOT initialized here.

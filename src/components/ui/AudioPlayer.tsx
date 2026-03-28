@@ -31,6 +31,10 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   const src = loadedSrc;
   const dragTimeRef = useRef<number>(0);
 
+  useEffect(() => {
+    setLoadedSrc(initialSrc ?? null);
+  }, [initialSrc]);
+
   // Create audio element imperatively (not in JSX) so ref is always stable
   // and event listeners attach before src is set.
   useEffect(() => {
@@ -180,13 +184,18 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       if (isPlaying) {
         audio?.pause();
       } else if (!src && onLoadRequest) {
-        // If no src loaded yet, request it
+        // If no src loaded yet, request it.
         setIsLoading(true);
-        const newSrc = await onLoadRequest();
-        setIsLoading(false);
-        if (newSrc) {
-          setLoadedSrc(newSrc);
-          // Playback will be triggered by the useEffect watching loadedSrc
+        setLoadError(null);
+
+        try {
+          const newSrc = await onLoadRequest();
+          if (newSrc) {
+            setLoadedSrc(newSrc);
+            // Playback will be triggered by the useEffect watching loadedSrc.
+          }
+        } finally {
+          setIsLoading(false);
         }
       } else if (audio && src) {
         // Stop all other players first
@@ -277,7 +286,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       </div>
 
       {loadError && (
-        <div className="text-xs text-red-500 mt-1">Error: {loadError}</div>
+        <div className="text-xs text-red-500 mt-1">{loadError}</div>
       )}
     </div>
   );

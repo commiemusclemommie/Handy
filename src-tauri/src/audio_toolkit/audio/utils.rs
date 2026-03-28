@@ -61,9 +61,11 @@ pub fn save_wav_file<P: AsRef<Path>>(file_path: P, samples: &[f32]) -> Result<()
 
 /// Decode any supported audio file (MP3, M4A, WAV, OGG, FLAC, etc.) and
 /// resample to 16 kHz mono f32 samples suitable for Whisper inference.
-pub fn decode_and_resample(path: std::path::PathBuf) -> Result<Vec<f32>, String> {
+pub fn decode_and_resample<P: AsRef<Path>>(path: P) -> Result<Vec<f32>, String> {
+    let path = path.as_ref();
+
     // Open the media source.
-    let src = File::open(&path).map_err(|e| format!("failed to open file: {}", e))?;
+    let src = File::open(path).map_err(|e| format!("failed to open file: {}", e))?;
 
     // Create the media source stream.
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
@@ -103,6 +105,11 @@ pub fn decode_and_resample(path: std::path::PathBuf) -> Result<Vec<f32>, String>
         .ok_or("missing sample rate")?;
 
     let mut samples: Vec<f32> = Vec::new();
+
+    // Maximum decompressed audio: 4 hours at the source sample rate.
+    // Compressed inputs can expand dramatically in memory, so cap the
+    // decoded sample count to avoid pathological OOM cases.
+    let max_decoded_samples: usize = 4 * 3600 * sample_rate as usize;
 
     // The decode loop.
     loop {
@@ -170,6 +177,67 @@ pub fn decode_and_resample(path: std::path::PathBuf) -> Result<Vec<f32>, String>
                         samples.push(sum / ch as f32);
                     }
                 }
+                AudioBufferRef::S32(buf) => {
+                    let ch = buf.spec().channels.count();
+                    for i in 0..buf.frames() {
+                        let mut sum: f32 = 0.0;
+                        for c in 0..ch {
+                            sum += buf.chan(c)[i] as f32 / 2_147_483_648.0;
+                        }
+                        samples.push(sum / ch as f32);
+                    }
+                }
+                AudioBufferRef::S24(buf) => {
+                    let ch = buf.spec().channels.count();
+                    for i in 0..buf.frames() {
+                        let mut sum: f32 = 0.0;
+                        for c in 0..ch {
+                            sum += buf.chan(c)[i].inner() as f32 / 8_388_608.0;
+                        }
+                        samples.push(sum / ch as f32);
+                    }
+                }
+                AudioBufferRef::U16(buf) => {
+                    let ch = buf.spec().channels.count();
+                    for i in 0..buf.frames() {
+                        let mut sum: f32 = 0.0;
+                        for c in 0..ch {
+                            sum += (buf.chan(c)[i] as f32 - 32_768.0) / 32_768.0;
+                        }
+                        samples.push(sum / ch as f32);
+                    }
+                }
+                AudioBufferRef::U24(buf) => {
+                    let ch = buf.spec().channels.count();
+                    for i in 0..buf.frames() {
+                        let mut sum: f32 = 0.0;
+                        for c in 0..ch {
+                            sum += (buf.chan(c)[i].inner() as f32 - 8_388_608.0) / 8_388_608.0;
+                        }
+                        samples.push(sum / ch as f32);
+                    }
+                }
+                AudioBufferRef::U32(buf) => {
+                    let ch = buf.spec().channels.count();
+                    for i in 0..buf.frames() {
+                        let mut sum: f32 = 0.0;
+                        for c in 0..ch {
+                            sum +=
+                                (buf.chan(c)[i] as f64 - 2_147_483_648.0) as f32 / 2_147_483_648.0;
+                        }
+                        samples.push(sum / ch as f32);
+                    }
+                }
+                AudioBufferRef::S8(buf) => {
+                    let ch = buf.spec().channels.count();
+                    for i in 0..buf.frames() {
+                        let mut sum: f32 = 0.0;
+                        for c in 0..ch {
+                            sum += buf.chan(c)[i] as f32 / 128.0;
+                        }
+                        samples.push(sum / ch as f32);
+                    }
+                }
                 _ => {
                     log::warn!("Unsupported sample format in audio buffer");
                 }
@@ -179,6 +247,13 @@ pub fn decode_and_resample(path: std::path::PathBuf) -> Result<Vec<f32>, String>
                 log::warn!("decode error: {}", e);
             }
             Err(e) => return Err(format!("failed to decode: {}", e)),
+        }
+
+        if samples.len() > max_decoded_samples {
+            return Err(format!(
+                "Audio too long (>{} hours at source sample rate). Please use a shorter file.",
+                max_decoded_samples / (sample_rate as usize) / 3600
+            ));
         }
     }
 
@@ -192,7 +267,8 @@ pub fn decode_and_resample(path: std::path::PathBuf) -> Result<Vec<f32>, String>
     let mut resampler = FftFixedIn::<f32>::new(sample_rate as usize, 16000, chunk_size, 1, 1)
         .map_err(|e| format!("failed to create resampler: {}", e))?;
 
-    let mut resampled_samples = Vec::with_capacity(samples.len());
+    let expected_output_len = (samples.len() as f64 * 16000.0 / sample_rate as f64).ceil() as usize;
+    let mut resampled_samples = Vec::with_capacity(expected_output_len);
     let mut input_buf = vec![0.0f32; chunk_size];
 
     for chunk in samples.chunks(chunk_size) {
@@ -213,6 +289,8 @@ pub fn decode_and_resample(path: std::path::PathBuf) -> Result<Vec<f32>, String>
 
         resampled_samples.extend_from_slice(&waves_out[0]);
     }
+
+    resampled_samples.truncate(expected_output_len);
 
     Ok(resampled_samples)
 }

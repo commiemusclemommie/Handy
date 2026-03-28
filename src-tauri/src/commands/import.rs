@@ -59,13 +59,28 @@ pub struct ImportProgress {
 /// Cancellation tokens for active imports
 pub struct ImportCancellationTokens {
     tokens: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Guard to prevent concurrent imports.
+    import_active: Arc<AtomicBool>,
 }
 
 impl ImportCancellationTokens {
     pub fn new() -> Self {
         Self {
             tokens: Arc::new(Mutex::new(HashMap::new())),
+            import_active: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Try to acquire the import lock. Returns false if an import is already running.
+    pub fn try_start(&self) -> bool {
+        self.import_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Release the import lock.
+    pub fn finish(&self) {
+        self.import_active.store(false, Ordering::SeqCst);
     }
 
     pub fn create_token(&self, import_id: &str) -> Arc<AtomicBool> {
@@ -93,6 +108,15 @@ impl ImportCancellationTokens {
         }
     }
 
+    /// Cancel all active imports. Used when the frontend doesn't know the import ID.
+    pub fn cancel_all(&self) {
+        if let Ok(tokens) = self.tokens.lock() {
+            for token in tokens.values() {
+                token.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn cleanup(&self, import_id: &str) {
         if let Ok(mut tokens) = self.tokens.lock() {
             tokens.remove(import_id);
@@ -103,6 +127,27 @@ impl ImportCancellationTokens {
 impl Default for ImportCancellationTokens {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+struct ActiveImportGuard {
+    cancellation_tokens: Arc<ImportCancellationTokens>,
+    import_id: String,
+}
+
+impl ActiveImportGuard {
+    fn new(cancellation_tokens: Arc<ImportCancellationTokens>, import_id: String) -> Self {
+        Self {
+            cancellation_tokens,
+            import_id,
+        }
+    }
+}
+
+impl Drop for ActiveImportGuard {
+    fn drop(&mut self) {
+        self.cancellation_tokens.cleanup(&self.import_id);
+        self.cancellation_tokens.finish();
     }
 }
 
@@ -305,10 +350,7 @@ fn build_chunks(app_handle: &AppHandle, samples: &[f32]) -> Vec<(usize, usize)> 
         Ok(raw_segments) if !raw_segments.is_empty() => {
             info!("VAD detected {} speech regions", raw_segments.len());
             let merged = merge_and_pad(&raw_segments, samples.len());
-            info!(
-                "After merge+pad: {} segments",
-                merged.len()
-            );
+            info!("After merge+pad: {} segments", merged.len());
             let chunks = segments_to_chunks(&merged);
             if !chunks.is_empty() {
                 info!("Created {} VAD-aware chunks", chunks.len());
@@ -470,41 +512,42 @@ pub async fn import_audio_file(
 ) -> Result<(), String> {
     use uuid::Uuid;
 
+    let cancellation_tokens = Arc::clone(&*cancellation_tokens);
+    if !cancellation_tokens.try_start() {
+        return Err("An import is already in progress".to_string());
+    }
+
     let import_id = Uuid::new_v4().to_string();
     let _cancel_token = cancellation_tokens.create_token(&import_id);
+    let _import_guard = ActiveImportGuard::new(Arc::clone(&cancellation_tokens), import_id.clone());
 
     info!("Importing audio file: {} (ID: {})", file_path, import_id);
     emit_progress(&app_handle, "starting", 0, "Starting import...");
 
     let source_path = PathBuf::from(&file_path);
 
-    // Validate
-    if let Err(e) = validate_audio_file(&source_path) {
-        emit_progress(&app_handle, "failed", 0, &e);
-        return Err(e);
-    }
+    validate_audio_file(&source_path).inspect_err(|error| {
+        emit_progress(&app_handle, "failed", 0, error);
+    })?;
 
-    check_cancelled(&app_handle, &cancellation_tokens, &import_id)?;
+    check_cancelled(&app_handle, cancellation_tokens.as_ref(), &import_id)?;
 
-    // Stage 1: Decode
     emit_progress(&app_handle, "decoding", 5, "Decoding audio file...");
+    let samples = decode_and_resample(&source_path).map_err(|e| {
+        let message = format!("Failed to decode audio: {}", e);
+        emit_progress(&app_handle, "failed", 0, &message);
+        message
+    })?;
 
-    let samples = match decode_and_resample(source_path.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("Failed to decode audio: {}", e);
-            emit_progress(&app_handle, "failed", 0, &msg);
-            cancellation_tokens.cleanup(&import_id);
-            return Err(msg);
-        }
-    };
-
-    check_cancelled(&app_handle, &cancellation_tokens, &import_id)?;
+    check_cancelled(&app_handle, cancellation_tokens.as_ref(), &import_id)?;
 
     let duration = samples.len() as f64 / SAMPLE_RATE as f64;
-    debug!("Audio duration: {:.2}s ({} samples)", duration, samples.len());
+    debug!(
+        "Audio duration: {:.2}s ({} samples)",
+        duration,
+        samples.len()
+    );
 
-    // Stage 2: Load model + transcribe
     emit_progress(
         &app_handle,
         "transcribing",
@@ -513,44 +556,37 @@ pub async fn import_audio_file(
     );
     transcription_state.initiate_model_load();
 
-    let transcription_text = match transcribe_with_chunking(
+    let transcription_text = transcribe_with_chunking(
         &app_handle,
         &transcription_state,
-        &cancellation_tokens,
+        cancellation_tokens.as_ref(),
         &import_id,
         &samples,
     )
     .await
-    {
-        Ok(text) => text,
-        Err(e) => {
-            emit_progress(&app_handle, "failed", 0, &e);
-            cancellation_tokens.cleanup(&import_id);
-            return Err(e);
-        }
-    };
+    .inspect_err(|error| {
+        emit_progress(&app_handle, "failed", 0, error);
+    })?;
 
-    check_cancelled(&app_handle, &cancellation_tokens, &import_id)?;
+    check_cancelled(&app_handle, cancellation_tokens.as_ref(), &import_id)?;
 
-    // Stage 3: Save
     emit_progress(&app_handle, "saving", 90, "Saving to database...");
 
-    let timestamp = chrono::Utc::now().timestamp();
     let recordings_dir = history_state.recordings_dir().to_path_buf();
-    if !recordings_dir.exists() {
-        fs::create_dir_all(&recordings_dir)
-            .map_err(|e| format!("Failed to create recordings dir: {}", e))?;
-    }
+    fs::create_dir_all(&recordings_dir).map_err(|e| {
+        let message = format!("Failed to create recordings dir: {}", e);
+        emit_progress(&app_handle, "failed", 0, &message);
+        message
+    })?;
 
-    let file_name = format!("handy-{}.wav", timestamp);
+    let file_name = format!("handy-import-{}.wav", import_id);
     let target_path = recordings_dir.join(&file_name);
 
-    if let Err(e) = save_wav_file(&target_path, &samples) {
-        let msg = format!("Failed to save audio: {}", e);
-        emit_progress(&app_handle, "failed", 0, &msg);
-        cancellation_tokens.cleanup(&import_id);
-        return Err(msg);
-    }
+    save_wav_file(&target_path, &samples).map_err(|e| {
+        let message = format!("Failed to save audio: {}", e);
+        emit_progress(&app_handle, "failed", 0, &message);
+        message
+    })?;
 
     if let Err(e) = history_state.save_entry_with_import(
         file_name,
@@ -561,10 +597,10 @@ pub async fn import_audio_file(
         Some(duration),
         Some("upload".to_string()),
     ) {
-        let msg = format!("Failed to save to database: {}", e);
-        emit_progress(&app_handle, "failed", 0, &msg);
-        cancellation_tokens.cleanup(&import_id);
-        return Err(msg);
+        let _ = fs::remove_file(&target_path);
+        let message = format!("Failed to save to database: {}", e);
+        emit_progress(&app_handle, "failed", 0, &message);
+        return Err(message);
     }
 
     emit_progress(
@@ -573,7 +609,6 @@ pub async fn import_audio_file(
         100,
         "Import completed successfully",
     );
-    cancellation_tokens.cleanup(&import_id);
     info!("Import completed successfully ({:.1}s audio)", duration);
     Ok(())
 }
@@ -584,8 +619,13 @@ pub async fn cancel_import(
     cancellation_tokens: State<'_, Arc<ImportCancellationTokens>>,
     import_id: String,
 ) -> Result<(), String> {
-    cancellation_tokens.cancel(&import_id);
-    info!("Import {} cancelled by user", import_id);
+    if import_id.is_empty() {
+        cancellation_tokens.cancel_all();
+        info!("All active imports cancelled by user");
+    } else {
+        cancellation_tokens.cancel(&import_id);
+        info!("Import {} cancelled by user", import_id);
+    }
     Ok(())
 }
 
@@ -602,13 +642,22 @@ mod tests {
         let id = "test-import-1";
         let _token = tokens.create_token(id);
 
-        assert!(!tokens.is_cancelled(id), "freshly created token should not be cancelled");
+        assert!(
+            !tokens.is_cancelled(id),
+            "freshly created token should not be cancelled"
+        );
 
         tokens.cancel(id);
-        assert!(tokens.is_cancelled(id), "token should be cancelled after cancel()");
+        assert!(
+            tokens.is_cancelled(id),
+            "token should be cancelled after cancel()"
+        );
 
         tokens.cleanup(id);
-        assert!(!tokens.is_cancelled(id), "cleaned up token should return false");
+        assert!(
+            !tokens.is_cancelled(id),
+            "cleaned up token should return false"
+        );
     }
 
     #[test]
@@ -620,7 +669,37 @@ mod tests {
 
         tokens.cancel("a");
         assert!(tokens.is_cancelled("a"));
-        assert!(!tokens.is_cancelled("b"), "cancelling 'a' should not affect 'b'");
+        assert!(
+            !tokens.is_cancelled("b"),
+            "cancelling 'a' should not affect 'b'"
+        );
+    }
+
+    #[test]
+    fn cancellation_cancel_all() {
+        let tokens = ImportCancellationTokens::new();
+
+        tokens.create_token("a");
+        tokens.create_token("b");
+        tokens.create_token("c");
+
+        tokens.cancel_all();
+        assert!(tokens.is_cancelled("a"));
+        assert!(tokens.is_cancelled("b"));
+        assert!(tokens.is_cancelled("c"));
+    }
+
+    #[test]
+    fn concurrent_import_guard() {
+        let tokens = ImportCancellationTokens::new();
+
+        assert!(tokens.try_start(), "first import should succeed");
+        assert!(!tokens.try_start(), "second import should be rejected");
+
+        tokens.finish();
+        assert!(tokens.try_start(), "import after finish should succeed");
+
+        tokens.finish();
     }
 
     #[test]
@@ -641,7 +720,10 @@ mod tests {
 
     #[test]
     fn merge_and_pad_single_segment() {
-        let segs = vec![SpeechSegment { start: 10_000, end: 20_000 }];
+        let segs = vec![SpeechSegment {
+            start: 10_000,
+            end: 20_000,
+        }];
         let result = merge_and_pad(&segs, 100_000);
 
         assert_eq!(result.len(), 1);
@@ -654,8 +736,14 @@ mod tests {
     fn merge_and_pad_merges_nearby() {
         // Two segments 0.5s apart (8000 samples) — should merge (gap < 1s)
         let segs = vec![
-            SpeechSegment { start: 10_000, end: 20_000 },
-            SpeechSegment { start: 28_000, end: 40_000 },
+            SpeechSegment {
+                start: 10_000,
+                end: 20_000,
+            },
+            SpeechSegment {
+                start: 28_000,
+                end: 40_000,
+            },
         ];
         let result = merge_and_pad(&segs, 100_000);
 
@@ -668,8 +756,14 @@ mod tests {
     fn merge_and_pad_keeps_distant_segments() {
         // Two segments 3s apart (48000 samples) — should NOT merge
         let segs = vec![
-            SpeechSegment { start: 10_000, end: 20_000 },
-            SpeechSegment { start: 68_000, end: 80_000 },
+            SpeechSegment {
+                start: 10_000,
+                end: 20_000,
+            },
+            SpeechSegment {
+                start: 68_000,
+                end: 80_000,
+            },
         ];
         let result = merge_and_pad(&segs, 100_000);
 
@@ -679,7 +773,10 @@ mod tests {
     #[test]
     fn merge_and_pad_clamps_to_bounds() {
         // Segment near start — padding should not go below 0
-        let segs = vec![SpeechSegment { start: 100, end: 5000 }];
+        let segs = vec![SpeechSegment {
+            start: 100,
+            end: 5000,
+        }];
         let result = merge_and_pad(&segs, 6000);
 
         assert_eq!(result[0].start, 0, "start should clamp to 0");
@@ -689,8 +786,14 @@ mod tests {
     #[test]
     fn segments_to_chunks_small_segments() {
         let segs = vec![
-            SpeechSegment { start: 0, end: 100_000 },    // ~6.25s
-            SpeechSegment { start: 200_000, end: 300_000 }, // ~6.25s
+            SpeechSegment {
+                start: 0,
+                end: 100_000,
+            }, // ~6.25s
+            SpeechSegment {
+                start: 200_000,
+                end: 300_000,
+            }, // ~6.25s
         ];
         let chunks = segments_to_chunks(&segs);
 
@@ -702,10 +805,17 @@ mod tests {
     #[test]
     fn segments_to_chunks_splits_large_segment() {
         // 90 seconds of audio = 1_440_000 samples — exceeds 30s max
-        let segs = vec![SpeechSegment { start: 0, end: 1_440_000 }];
+        let segs = vec![SpeechSegment {
+            start: 0,
+            end: 1_440_000,
+        }];
         let chunks = segments_to_chunks(&segs);
 
-        assert!(chunks.len() >= 3, "90s segment should produce at least 3 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "90s segment should produce at least 3 chunks, got {}",
+            chunks.len()
+        );
 
         // Each chunk should be <= MAX_CHUNK_SAMPLES
         for (i, (start, end)) in chunks.iter().enumerate() {
@@ -713,13 +823,19 @@ mod tests {
             assert!(
                 len <= MAX_CHUNK_SAMPLES,
                 "chunk {} has {} samples, exceeds max {}",
-                i, len, MAX_CHUNK_SAMPLES
+                i,
+                len,
+                MAX_CHUNK_SAMPLES
             );
         }
 
         // Chunks should cover the full range
         assert_eq!(chunks[0].0, 0, "first chunk should start at 0");
-        assert_eq!(chunks.last().unwrap().1, 1_440_000, "last chunk should end at total");
+        assert_eq!(
+            chunks.last().unwrap().1,
+            1_440_000,
+            "last chunk should end at total"
+        );
 
         // Chunks should overlap (1 second = 16000 samples)
         for pair in chunks.windows(2) {
@@ -728,7 +844,8 @@ mod tests {
             assert!(
                 start_b < end_a,
                 "chunks should overlap: chunk ends at {} but next starts at {}",
-                end_a, start_b
+                end_a,
+                start_b
             );
         }
     }
@@ -736,7 +853,10 @@ mod tests {
     #[test]
     fn segments_to_chunks_exact_max_size() {
         // Exactly 30s — should be one chunk, no split
-        let segs = vec![SpeechSegment { start: 0, end: MAX_CHUNK_SAMPLES }];
+        let segs = vec![SpeechSegment {
+            start: 0,
+            end: MAX_CHUNK_SAMPLES,
+        }];
         let chunks = segments_to_chunks(&segs);
         assert_eq!(chunks.len(), 1);
     }
@@ -752,7 +872,11 @@ mod tests {
         }
         let samples = decode_and_resample(path).expect("should decode short wav");
         let duration = samples.len() as f64 / SAMPLE_RATE as f64;
-        assert!((duration - 10.0).abs() < 0.5, "expected ~10s, got {:.1}s", duration);
+        assert!(
+            (duration - 10.0).abs() < 0.5,
+            "expected ~10s, got {:.1}s",
+            duration
+        );
     }
 
     #[test]
@@ -764,7 +888,11 @@ mod tests {
         }
         let samples = decode_and_resample(path).expect("should decode tiny wav");
         let duration = samples.len() as f64 / SAMPLE_RATE as f64;
-        assert!((duration - 1.0).abs() < 0.2, "expected ~1s, got {:.1}s", duration);
+        assert!(
+            (duration - 1.0).abs() < 0.2,
+            "expected ~1s, got {:.1}s",
+            duration
+        );
     }
 
     #[test]
@@ -775,7 +903,10 @@ mod tests {
             return;
         }
         let samples = decode_and_resample(path).expect("should decode micro wav");
-        assert!(!samples.is_empty(), "even 100ms file should produce samples");
+        assert!(
+            !samples.is_empty(),
+            "even 100ms file should produce samples"
+        );
     }
 
     #[test]
@@ -788,7 +919,11 @@ mod tests {
         let samples = decode_and_resample(path).expect("should decode+resample stereo 48kHz");
         let duration = samples.len() as f64 / SAMPLE_RATE as f64;
         // 48kHz stereo → 16kHz mono: duration should be preserved
-        assert!((duration - 5.0).abs() < 1.0, "expected ~5s, got {:.1}s", duration);
+        assert!(
+            (duration - 5.0).abs() < 1.0,
+            "expected ~5s, got {:.1}s",
+            duration
+        );
     }
 
     #[test]
@@ -800,7 +935,11 @@ mod tests {
         }
         let samples = decode_and_resample(path).expect("should decode 90s wav");
         let duration = samples.len() as f64 / SAMPLE_RATE as f64;
-        assert!((duration - 90.0).abs() < 1.0, "expected ~90s, got {:.1}s", duration);
+        assert!(
+            (duration - 90.0).abs() < 1.0,
+            "expected ~90s, got {:.1}s",
+            duration
+        );
     }
 
     #[test]
@@ -865,7 +1004,11 @@ mod tests {
         // Reload
         let loaded = decode_and_resample(path.to_path_buf()).expect("should decode saved wav");
         let dur = loaded.len() as f64 / SAMPLE_RATE as f64;
-        assert!((dur - 1.0).abs() < 0.2, "round-trip duration should be ~1s, got {:.2}s", dur);
+        assert!(
+            (dur - 1.0).abs() < 0.2,
+            "round-trip duration should be ~1s, got {:.2}s",
+            dur
+        );
     }
 
     // ── History schema tests ─────────────────────────────────────
@@ -905,38 +1048,76 @@ mod tests {
         // 1. Decode
         let samples = decode_and_resample(input_path).expect("decode should succeed");
         let duration = samples.len() as f64 / SAMPLE_RATE as f64;
-        assert!((duration - 120.0).abs() < 1.0, "expected ~120s, got {:.1}s", duration);
+        assert!(
+            (duration - 120.0).abs() < 1.0,
+            "expected ~120s, got {:.1}s",
+            duration
+        );
 
         // 2. Build chunks (without VAD since we don't have AppHandle in tests)
         //    Test the segment logic directly
         let segments = vec![
-            SpeechSegment { start: 0, end: 320_000 },       // 0-20s
-            SpeechSegment { start: 330_000, end: 500_000 },  // 20.6-31.25s
-            SpeechSegment { start: 800_000, end: 1_200_000 }, // 50-75s (25s)
-            SpeechSegment { start: 1_500_000, end: 1_920_000 }, // 93.75-120s (26.25s)
+            SpeechSegment {
+                start: 0,
+                end: 320_000,
+            }, // 0-20s
+            SpeechSegment {
+                start: 330_000,
+                end: 500_000,
+            }, // 20.6-31.25s
+            SpeechSegment {
+                start: 800_000,
+                end: 1_200_000,
+            }, // 50-75s (25s)
+            SpeechSegment {
+                start: 1_500_000,
+                end: 1_920_000,
+            }, // 93.75-120s (26.25s)
         ];
         let merged = merge_and_pad(&segments, samples.len());
         let chunks = segments_to_chunks(&merged);
 
         // Verify all chunks are within bounds
         for (i, (start, end)) in chunks.iter().enumerate() {
-            assert!(*end <= samples.len(),
-                "chunk {} end {} exceeds total {}", i, end, samples.len());
-            assert!(*start < *end,
-                "chunk {} has invalid range {}-{}", i, start, end);
-            assert!(*end - *start <= MAX_CHUNK_SAMPLES,
-                "chunk {} too large: {} samples", i, end - start);
+            assert!(
+                *end <= samples.len(),
+                "chunk {} end {} exceeds total {}",
+                i,
+                end,
+                samples.len()
+            );
+            assert!(
+                *start < *end,
+                "chunk {} has invalid range {}-{}",
+                i,
+                start,
+                end
+            );
+            assert!(
+                *end - *start <= MAX_CHUNK_SAMPLES,
+                "chunk {} too large: {} samples",
+                i,
+                end - start
+            );
         }
 
         // 3. Save
         let tmp_dir = tempfile::tempdir().unwrap();
         let out_path = tmp_dir.path().join("imported.wav");
         save_wav_file(&out_path, &samples).expect("save should succeed");
-        
-        let file_size = fs::metadata(&out_path).unwrap().len();
-        assert!(file_size > 100_000, "saved file should be substantial, got {} bytes", file_size);
 
-        println!("Pipeline test passed: {:.1}s audio → {} chunks → {} byte WAV",
-            duration, chunks.len(), file_size);
+        let file_size = fs::metadata(&out_path).unwrap().len();
+        assert!(
+            file_size > 100_000,
+            "saved file should be substantial, got {} bytes",
+            file_size
+        );
+
+        println!(
+            "Pipeline test passed: {:.1}s audio → {} chunks → {} byte WAV",
+            duration,
+            chunks.len(),
+            file_size
+        );
     }
 }

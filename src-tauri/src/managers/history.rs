@@ -55,7 +55,7 @@ pub enum HistoryUpdatePayload {
     #[serde(rename = "deleted")]
     Deleted { id: i64 },
     #[serde(rename = "toggled")]
-    Toggled { id: i64 },
+    Toggled { id: i64, saved: bool },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -160,10 +160,7 @@ impl HistoryManager {
         let expected: &[(&str, &str)] = &[
             ("post_processed_text", "TEXT"),
             ("post_process_prompt", "TEXT"),
-            (
-                "post_process_requested",
-                "BOOLEAN NOT NULL DEFAULT 0",
-            ),
+            ("post_process_requested", "BOOLEAN NOT NULL DEFAULT 0"),
             ("duration", "REAL"),
             ("source", "TEXT DEFAULT 'recording'"),
         ];
@@ -441,21 +438,24 @@ impl HistoryManager {
         let mut deleted_count = 0;
 
         for (id, file_name) in entries {
-            // Delete database entry
             conn.execute(
                 "DELETE FROM transcription_history WHERE id = ?1",
                 params![id],
             )?;
 
-            // Delete WAV file
             let file_path = self.recordings_dir.join(file_name);
             if file_path.exists() {
                 if let Err(e) = fs::remove_file(&file_path) {
                     error!("Failed to delete WAV file {}: {}", file_name, e);
                 } else {
                     debug!("Deleted old WAV file: {}", file_name);
-                    deleted_count += 1;
                 }
+            }
+
+            deleted_count += 1;
+
+            if let Err(e) = (HistoryUpdatePayload::Deleted { id: *id }).emit(&self.app_handle) {
+                error!("Failed to emit history-updated event: {}", e);
             }
         }
 
@@ -662,8 +662,12 @@ impl HistoryManager {
 
         debug!("Toggled saved status for entry {}: {}", id, new_saved);
 
-        // Emit history updated event
-        if let Err(e) = (HistoryUpdatePayload::Toggled { id }).emit(&self.app_handle) {
+        if let Err(e) = (HistoryUpdatePayload::Toggled {
+            id,
+            saved: new_saved,
+        })
+        .emit(&self.app_handle)
+        {
             error!("Failed to emit history-updated event: {}", e);
         }
 
@@ -672,6 +676,30 @@ impl HistoryManager {
 
     pub fn get_audio_file_path(&self, file_name: &str) -> PathBuf {
         self.recordings_dir.join(file_name)
+    }
+
+    pub fn resolve_recording_path(&self, file_name: &str) -> Result<PathBuf> {
+        if file_name.is_empty()
+            || file_name.contains('/')
+            || file_name.contains('\\')
+            || file_name.contains("..")
+        {
+            return Err(anyhow!("Invalid file name"));
+        }
+
+        let path = self.get_audio_file_path(file_name);
+        if !path.exists() {
+            return Err(anyhow!("Audio file not found: {}", file_name));
+        }
+
+        let canonical_path = path.canonicalize()?;
+        let canonical_recordings_dir = self.recordings_dir.canonicalize()?;
+
+        if !canonical_path.starts_with(&canonical_recordings_dir) {
+            return Err(anyhow!("Invalid file name"));
+        }
+
+        Ok(canonical_path)
     }
 
     pub async fn get_entry_by_id(&self, id: i64) -> Result<Option<HistoryEntry>> {
@@ -713,15 +741,17 @@ impl HistoryManager {
             }
         }
 
-        // Delete from database
-        conn.execute(
+        let deleted = conn.execute(
             "DELETE FROM transcription_history WHERE id = ?1",
             params![id],
         )?;
 
+        if deleted == 0 {
+            return Err(anyhow!("History entry {} not found", id));
+        }
+
         debug!("Deleted history entry with id: {}", id);
 
-        // Emit history updated event
         if let Err(e) = (HistoryUpdatePayload::Deleted { id }).emit(&self.app_handle) {
             error!("Failed to emit history-updated event: {}", e);
         }
