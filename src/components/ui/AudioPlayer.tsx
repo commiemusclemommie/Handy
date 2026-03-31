@@ -33,17 +33,34 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   const src = loadedSrc;
   const dragTimeRef = useRef<number>(0);
   const attemptedFallbackRef = useRef(false);
+  const desiredPlayingRef = useRef(false);
+  const loadedSrcRef = useRef(loadedSrc);
+  const onLoadRequestRef = useRef(onLoadRequest);
 
   useEffect(() => {
-    setLoadedSrc(initialSrc ?? null);
-    attemptedFallbackRef.current = false;
-  }, [initialSrc]);
+    onLoadRequestRef.current = onLoadRequest;
+  }, [onLoadRequest]);
 
-  // Create audio element imperatively (not in JSX) so ref is always stable
-  // and event listeners attach before src is set.
   useEffect(() => {
-    if (!src) return;
+    loadedSrcRef.current = loadedSrc;
+  }, [loadedSrc]);
 
+  const loadSource = useCallback((audio: HTMLAudioElement, newSrc: string) => {
+    if (audio.src === newSrc) {
+      return;
+    }
+
+    audio.pause();
+    audio.currentTime = 0;
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+    setLoadError(null);
+    audio.src = newSrc;
+    audio.load();
+  }, []);
+
+  useEffect(() => {
     const audio = new Audio();
     audio.preload = "metadata";
     audioRef.current = audio;
@@ -68,6 +85,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
     };
 
     const handleEnded = () => {
+      desiredPlayingRef.current = false;
       setIsPlaying(false);
       setCurrentTime(audio.duration || 0);
     };
@@ -80,17 +98,23 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
     };
 
     const handleError = async () => {
-      console.error("Audio load error:", audio.error);
+      console.error("Audio load/play error:", audio.error);
 
-      if (onLoadRequest && !attemptedFallbackRef.current && src) {
+      const loadRequest = onLoadRequestRef.current;
+      const currentSrc = loadedSrcRef.current || audio.currentSrc || audio.src;
+      if (loadRequest && !attemptedFallbackRef.current && currentSrc) {
         attemptedFallbackRef.current = true;
         setIsLoading(true);
 
         try {
-          const fallbackSrc = await onLoadRequest(true);
-          if (fallbackSrc && fallbackSrc !== src) {
-            setLoadError(null);
+          const fallbackSrc = await loadRequest(true);
+          if (fallbackSrc && fallbackSrc !== currentSrc) {
             setLoadedSrc(fallbackSrc);
+            loadSource(audio, fallbackSrc);
+
+            if (desiredPlayingRef.current) {
+              await audio.play();
+            }
             return;
           }
         } catch (error) {
@@ -100,6 +124,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
         }
       }
 
+      desiredPlayingRef.current = false;
       setLoadError(audio.error?.message || "Failed to load audio");
     };
 
@@ -111,9 +136,6 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
     audio.addEventListener("pause", handlePause);
     audio.addEventListener("timeupdate", handleTimeUpdate);
     audio.addEventListener("error", handleError);
-
-    // Set src after attaching listeners
-    audio.src = src;
 
     return () => {
       audio.pause();
@@ -128,10 +150,38 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       audio.src = "";
       audioRef.current = null;
     };
-  }, [src]); // Recreate when src changes
+  }, [loadSource]);
+  useEffect(() => {
+    const audio = audioRef.current;
+    setLoadedSrc(initialSrc ?? null);
+    attemptedFallbackRef.current = false;
 
+    if (!audio) {
+      return;
+    }
+
+    if (initialSrc) {
+      loadSource(audio, initialSrc);
+      if (autoPlay) {
+        desiredPlayingRef.current = true;
+        audio.play().catch((error) => {
+          console.error("Auto-play failed:", error);
+        });
+      }
+    } else {
+      desiredPlayingRef.current = false;
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+      setIsPlaying(false);
+      setDuration(0);
+      setCurrentTime(0);
+      setLoadError(null);
+    }
+  }, [autoPlay, initialSrc, loadSource]);
   // Register stop callback for global "only one player at a time"
   const stopPlayback = useCallback(() => {
+    desiredPlayingRef.current = false;
     audioRef.current?.pause();
   }, []);
 
@@ -141,32 +191,6 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       activePlayers.delete(stopPlayback);
     };
   }, [stopPlayback]);
-
-  // Auto-play when src becomes available (via onLoadRequest)
-  const prevLoadedSrc = useRef<string | null>(null);
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-
-    if (loadedSrc && !prevLoadedSrc.current && onLoadRequest) {
-      // Stop all others first
-      activePlayers.forEach((stop) => {
-        if (stop !== stopPlayback) stop();
-      });
-      audio.play().catch((error) => {
-        console.error("Auto-play failed:", error);
-      });
-    } else if (autoPlay && initialSrc && !prevLoadedSrc.current) {
-      activePlayers.forEach((stop) => {
-        if (stop !== stopPlayback) stop();
-      });
-      audio.play().catch((error) => {
-        console.error("Auto-play failed:", error);
-      });
-    }
-
-    prevLoadedSrc.current = loadedSrc;
-  }, [loadedSrc, autoPlay, initialSrc, onLoadRequest, stopPlayback]);
 
   // Global drag handlers
   const handleMouseUp = useCallback(() => {
@@ -201,28 +225,35 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
 
   const togglePlay = async () => {
     const audio = audioRef.current;
-    if (isLoading) return;
+    if (!audio || isLoading) return;
 
     try {
       if (isPlaying) {
-        audio?.pause();
+        desiredPlayingRef.current = false;
+        audio.pause();
       } else if (!src && onLoadRequest) {
-        // If no src loaded yet, request it.
         setIsLoading(true);
         setLoadError(null);
+        desiredPlayingRef.current = true;
 
         try {
           const newSrc = await onLoadRequest(false);
           if (newSrc) {
             attemptedFallbackRef.current = false;
             setLoadedSrc(newSrc);
-            // Playback will be triggered by the useEffect watching loadedSrc.
+            loadSource(audio, newSrc);
+
+            activePlayers.forEach((stop) => {
+              if (stop !== stopPlayback) stop();
+            });
+
+            await audio.play();
           }
         } finally {
           setIsLoading(false);
         }
-      } else if (audio && src) {
-        // Stop all other players first
+      } else {
+        desiredPlayingRef.current = true;
         activePlayers.forEach((stop) => {
           if (stop !== stopPlayback) stop();
         });
@@ -269,8 +300,6 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
 
   return (
     <div className={`flex items-center gap-3 ${className}`}>
-      {/* No JSX <audio> — created imperatively above */}
-
       <button
         onClick={togglePlay}
         disabled={isLoading}
