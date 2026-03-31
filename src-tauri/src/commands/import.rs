@@ -36,11 +36,15 @@ const MAX_CHUNK_SAMPLES: usize = (MAX_CHUNK_SECS as usize) * SAMPLE_RATE;
 /// Padding around speech segments in seconds.
 /// Adds a small buffer before and after each speech region to avoid
 /// clipping the start/end of words.
-const SEGMENT_PADDING_SECS: f32 = 0.3;
+const SEGMENT_PADDING_SECS: f32 = 0.5;
 
 /// Silence gaps shorter than this (in seconds) are merged — they're
 /// likely just natural pauses within a sentence.
 const MERGE_GAP_SECS: f32 = 1.0;
+
+/// Overlap between forced chunk splits for long continuous speech.
+/// This gives the model extra context at chunk boundaries.
+const CHUNK_OVERLAP_SAMPLES: usize = SAMPLE_RATE * 2;
 
 /// Audio shorter than this (in seconds) is transcribed in one shot.
 const CHUNK_THRESHOLD_SECS: f64 = 35.0;
@@ -278,64 +282,98 @@ fn detect_speech_segments(
     Ok(segments)
 }
 
-/// Merge segments that are closer together than `gap` samples,
-/// then pad each segment by `pad` samples.
-fn merge_and_pad(segments: &[SpeechSegment], total_samples: usize) -> Vec<SpeechSegment> {
+fn apply_segment_padding(start: usize, end: usize, total_samples: usize) -> (usize, usize) {
+    let pad = (SEGMENT_PADDING_SECS * SAMPLE_RATE as f32) as usize;
+    (start.saturating_sub(pad), (end + pad).min(total_samples))
+}
+
+/// Group nearby VAD segments together while preserving their internal
+/// silence boundaries so chunking can still split on natural gaps.
+fn group_segments(segments: &[SpeechSegment]) -> Vec<Vec<SpeechSegment>> {
     if segments.is_empty() {
         return vec![];
     }
 
     let gap = (MERGE_GAP_SECS * SAMPLE_RATE as f32) as usize;
-    let pad = (SEGMENT_PADDING_SECS * SAMPLE_RATE as f32) as usize;
-
-    // Merge nearby segments
-    let mut merged: Vec<SpeechSegment> = Vec::new();
-    let mut current = segments[0].clone();
+    let mut groups: Vec<Vec<SpeechSegment>> = vec![vec![segments[0].clone()]];
 
     for seg in &segments[1..] {
-        if seg.start <= current.end + gap {
-            // Merge
-            current.end = current.end.max(seg.end);
+        let current_group = groups.last_mut().expect("group exists");
+        let last = current_group.last().expect("segment exists");
+
+        if seg.start <= last.end + gap {
+            current_group.push(seg.clone());
         } else {
-            merged.push(current);
-            current = seg.clone();
+            groups.push(vec![seg.clone()]);
         }
     }
-    merged.push(current);
 
-    // Pad
-    for seg in &mut merged {
-        seg.start = seg.start.saturating_sub(pad);
-        seg.end = (seg.end + pad).min(total_samples);
-    }
-
-    merged
+    groups
 }
 
-/// Convert speech segments into transcription chunks, splitting any
-/// segment that exceeds MAX_CHUNK_SAMPLES at the midpoint of the
-/// longest internal silence gap.
-fn segments_to_chunks(segments: &[SpeechSegment]) -> Vec<(usize, usize)> {
-    let mut chunks: Vec<(usize, usize)> = Vec::new();
+/// Split a single long continuous speech segment with overlap.
+/// This is the fallback when VAD cannot find a suitable internal pause.
+fn split_oversized_segment(segment: &SpeechSegment, total_samples: usize) -> Vec<(usize, usize)> {
+    let overlap = CHUNK_OVERLAP_SAMPLES.min(MAX_CHUNK_SAMPLES / 3);
+    let step = MAX_CHUNK_SAMPLES.saturating_sub(overlap).max(1);
+    let mut chunks = Vec::new();
+    let mut pos = segment.start;
 
-    for seg in segments {
-        let len = seg.end - seg.start;
-        if len <= MAX_CHUNK_SAMPLES {
-            chunks.push((seg.start, seg.end));
-        } else {
-            // Split oversized segments with simple fixed-step splitting.
-            // Use 1-second overlap so words at boundaries aren't lost.
-            let overlap = SAMPLE_RATE; // 1 second
-            let step = MAX_CHUNK_SAMPLES - overlap;
-            let mut pos = seg.start;
-            while pos < seg.end {
-                let chunk_end = (pos + MAX_CHUNK_SAMPLES).min(seg.end);
-                chunks.push((pos, chunk_end));
-                if chunk_end >= seg.end {
+    while pos < segment.end {
+        let chunk_end = (pos + MAX_CHUNK_SAMPLES).min(segment.end);
+        chunks.push(apply_segment_padding(pos, chunk_end, total_samples));
+        if chunk_end >= segment.end {
+            break;
+        }
+        pos += step;
+    }
+
+    chunks
+}
+
+/// Convert grouped speech segments into transcription chunks.
+/// Natural VAD boundaries are preferred over arbitrary time-based cuts.
+fn groups_to_chunks(groups: &[Vec<SpeechSegment>], total_samples: usize) -> Vec<(usize, usize)> {
+    let mut chunks = Vec::new();
+
+    for group in groups {
+        if group.is_empty() {
+            continue;
+        }
+
+        let mut chunk_start_idx = 0;
+        while chunk_start_idx < group.len() {
+            let mut chunk_end_idx = chunk_start_idx;
+
+            while chunk_end_idx + 1 < group.len() {
+                let candidate_end = group[chunk_end_idx + 1].end;
+                let (padded_start, padded_end) = apply_segment_padding(
+                    group[chunk_start_idx].start,
+                    candidate_end,
+                    total_samples,
+                );
+
+                if padded_end - padded_start > MAX_CHUNK_SAMPLES {
                     break;
                 }
-                pos += step;
+
+                chunk_end_idx += 1;
             }
+
+            let combined = SpeechSegment {
+                start: group[chunk_start_idx].start,
+                end: group[chunk_end_idx].end,
+            };
+            let (padded_start, padded_end) =
+                apply_segment_padding(combined.start, combined.end, total_samples);
+
+            if chunk_start_idx == chunk_end_idx && padded_end - padded_start > MAX_CHUNK_SAMPLES {
+                chunks.extend(split_oversized_segment(&combined, total_samples));
+            } else {
+                chunks.push((padded_start, padded_end));
+            }
+
+            chunk_start_idx = chunk_end_idx + 1;
         }
     }
 
@@ -349,9 +387,9 @@ fn build_chunks(app_handle: &AppHandle, samples: &[f32]) -> Vec<(usize, usize)> 
     match detect_speech_segments(app_handle, samples) {
         Ok(raw_segments) if !raw_segments.is_empty() => {
             info!("VAD detected {} speech regions", raw_segments.len());
-            let merged = merge_and_pad(&raw_segments, samples.len());
-            info!("After merge+pad: {} segments", merged.len());
-            let chunks = segments_to_chunks(&merged);
+            let groups = group_segments(&raw_segments);
+            info!("Grouped speech into {} segment groups", groups.len());
+            let chunks = groups_to_chunks(&groups, samples.len());
             if !chunks.is_empty() {
                 info!("Created {} VAD-aware chunks", chunks.len());
                 return chunks;
@@ -365,9 +403,9 @@ fn build_chunks(app_handle: &AppHandle, samples: &[f32]) -> Vec<(usize, usize)> 
         }
     }
 
-    // Fallback: fixed-size chunks with 1-second overlap
-    let overlap = SAMPLE_RATE;
-    let step = MAX_CHUNK_SAMPLES - overlap;
+    // Fallback: fixed-size chunks with overlap.
+    let overlap = CHUNK_OVERLAP_SAMPLES.min(MAX_CHUNK_SAMPLES / 3);
+    let step = MAX_CHUNK_SAMPLES.saturating_sub(overlap).max(1);
     let mut chunks = Vec::new();
     let mut pos = 0usize;
     while pos < samples.len() {
@@ -713,28 +751,35 @@ mod tests {
     // ── Chunking logic tests ─────────────────────────────────────
 
     #[test]
-    fn merge_and_pad_empty() {
-        let result = merge_and_pad(&[], 100_000);
+    fn apply_segment_padding_clamps_to_bounds() {
+        let (start, end) = apply_segment_padding(100, 5_000, 6_000);
+        assert_eq!(start, 0, "start should clamp to 0");
+        assert_eq!(end, 6_000, "end should clamp to total_samples");
+    }
+
+    #[test]
+    fn group_segments_empty() {
+        let result = group_segments(&[]);
         assert!(result.is_empty());
     }
 
     #[test]
-    fn merge_and_pad_single_segment() {
+    fn group_segments_single_segment() {
         let segs = vec![SpeechSegment {
             start: 10_000,
             end: 20_000,
         }];
-        let result = merge_and_pad(&segs, 100_000);
+        let result = group_segments(&segs);
 
         assert_eq!(result.len(), 1);
-        // Padding is 0.3s * 16000 = 4800 samples
-        assert_eq!(result[0].start, 10_000 - 4800);
-        assert_eq!(result[0].end, 20_000 + 4800);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0].start, 10_000);
+        assert_eq!(result[0][0].end, 20_000);
     }
 
     #[test]
-    fn merge_and_pad_merges_nearby() {
-        // Two segments 0.5s apart (8000 samples) — should merge (gap < 1s)
+    fn group_segments_merges_nearby() {
+        // Two segments 0.5s apart (8000 samples) — should group together (gap < 1s)
         let segs = vec![
             SpeechSegment {
                 start: 10_000,
@@ -745,16 +790,15 @@ mod tests {
                 end: 40_000,
             },
         ];
-        let result = merge_and_pad(&segs, 100_000);
+        let result = group_segments(&segs);
 
-        assert_eq!(result.len(), 1, "nearby segments should merge");
-        assert!(result[0].start < 10_000, "should be padded before start");
-        assert!(result[0].end > 40_000, "should be padded after end");
+        assert_eq!(result.len(), 1, "nearby segments should share one group");
+        assert_eq!(result[0].len(), 2);
     }
 
     #[test]
-    fn merge_and_pad_keeps_distant_segments() {
-        // Two segments 3s apart (48000 samples) — should NOT merge
+    fn group_segments_keeps_distant_segments_apart() {
+        // Two segments 3s apart (48000 samples) — should NOT group together
         let segs = vec![
             SpeechSegment {
                 start: 10_000,
@@ -765,51 +809,68 @@ mod tests {
                 end: 80_000,
             },
         ];
-        let result = merge_and_pad(&segs, 100_000);
+        let result = group_segments(&segs);
 
         assert_eq!(result.len(), 2, "distant segments should stay separate");
     }
 
     #[test]
-    fn merge_and_pad_clamps_to_bounds() {
-        // Segment near start — padding should not go below 0
-        let segs = vec![SpeechSegment {
-            start: 100,
-            end: 5000,
-        }];
-        let result = merge_and_pad(&segs, 6000);
-
-        assert_eq!(result[0].start, 0, "start should clamp to 0");
-        assert_eq!(result[0].end, 6000, "end should clamp to total_samples");
-    }
-
-    #[test]
-    fn segments_to_chunks_small_segments() {
-        let segs = vec![
-            SpeechSegment {
+    fn groups_to_chunks_keeps_small_groups_separate() {
+        let groups = vec![
+            vec![SpeechSegment {
                 start: 0,
                 end: 100_000,
-            }, // ~6.25s
-            SpeechSegment {
+            }],
+            vec![SpeechSegment {
                 start: 200_000,
                 end: 300_000,
-            }, // ~6.25s
+            }],
         ];
-        let chunks = segments_to_chunks(&segs);
+        let chunks = groups_to_chunks(&groups, 400_000);
 
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], (0, 100_000));
-        assert_eq!(chunks[1], (200_000, 300_000));
+        assert_eq!(chunks[0].0, 0);
+        assert!(chunks[0].1 >= 100_000);
+        assert!(chunks[1].0 < 200_000);
+        assert!(chunks[1].1 > 300_000);
     }
 
     #[test]
-    fn segments_to_chunks_splits_large_segment() {
-        // 90 seconds of audio = 1_440_000 samples — exceeds 30s max
-        let segs = vec![SpeechSegment {
+    fn groups_to_chunks_prefers_natural_boundaries() {
+        let groups = vec![vec![
+            SpeechSegment {
+                start: 0,
+                end: 200_000,
+            },
+            SpeechSegment {
+                start: 208_000,
+                end: 408_000,
+            },
+            SpeechSegment {
+                start: 416_000,
+                end: 616_000,
+            },
+        ]];
+
+        let chunks = groups_to_chunks(&groups, 700_000);
+
+        assert_eq!(
+            chunks.len(),
+            2,
+            "should split on segment boundary, not mid-speech"
+        );
+        assert!(chunks[0].1 <= groups[0][1].end + 8_000);
+        assert!(chunks[1].0 >= groups[0][2].start.saturating_sub(8_000));
+    }
+
+    #[test]
+    fn groups_to_chunks_splits_large_segment_with_overlap() {
+        // 90 seconds of continuous speech = 1_440_000 samples — exceeds 30s max
+        let groups = vec![vec![SpeechSegment {
             start: 0,
             end: 1_440_000,
-        }];
-        let chunks = segments_to_chunks(&segs);
+        }]];
+        let chunks = groups_to_chunks(&groups, 1_440_000);
 
         assert!(
             chunks.len() >= 3,
@@ -817,19 +878,16 @@ mod tests {
             chunks.len()
         );
 
-        // Each chunk should be <= MAX_CHUNK_SAMPLES
         for (i, (start, end)) in chunks.iter().enumerate() {
             let len = end - start;
             assert!(
-                len <= MAX_CHUNK_SAMPLES,
-                "chunk {} has {} samples, exceeds max {}",
+                len <= MAX_CHUNK_SAMPLES + 2 * (SEGMENT_PADDING_SECS * SAMPLE_RATE as f32) as usize,
+                "chunk {} has {} samples, exceeds expected padded max",
                 i,
-                len,
-                MAX_CHUNK_SAMPLES
+                len
             );
         }
 
-        // Chunks should cover the full range
         assert_eq!(chunks[0].0, 0, "first chunk should start at 0");
         assert_eq!(
             chunks.last().unwrap().1,
@@ -837,7 +895,6 @@ mod tests {
             "last chunk should end at total"
         );
 
-        // Chunks should overlap (1 second = 16000 samples)
         for pair in chunks.windows(2) {
             let (_, end_a) = pair[0];
             let (start_b, _) = pair[1];
@@ -851,13 +908,12 @@ mod tests {
     }
 
     #[test]
-    fn segments_to_chunks_exact_max_size() {
-        // Exactly 30s — should be one chunk, no split
-        let segs = vec![SpeechSegment {
-            start: 0,
-            end: MAX_CHUNK_SAMPLES,
-        }];
-        let chunks = segments_to_chunks(&segs);
+    fn groups_to_chunks_exact_max_size() {
+        let groups = vec![vec![SpeechSegment {
+            start: 8_000,
+            end: 8_000 + (MAX_CHUNK_SAMPLES - 16_000),
+        }]];
+        let chunks = groups_to_chunks(&groups, 600_000);
         assert_eq!(chunks.len(), 1);
     }
 
@@ -1074,8 +1130,8 @@ mod tests {
                 end: 1_920_000,
             }, // 93.75-120s (26.25s)
         ];
-        let merged = merge_and_pad(&segments, samples.len());
-        let chunks = segments_to_chunks(&merged);
+        let groups = group_segments(&segments);
+        let chunks = groups_to_chunks(&groups, samples.len());
 
         // Verify all chunks are within bounds
         for (i, (start, end)) in chunks.iter().enumerate() {
