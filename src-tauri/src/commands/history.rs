@@ -4,6 +4,8 @@ use crate::managers::{
     transcription::TranscriptionManager,
 };
 use base64::Engine;
+use hound::{WavSpec, WavWriter};
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
@@ -79,6 +81,35 @@ fn infer_audio_mime_type(path: &Path) -> &'static str {
         Some("aiff") | Some("aif") => "audio/aiff",
         _ => "application/octet-stream",
     }
+}
+
+fn wav_data_url_from_samples(samples: &[f32]) -> Result<String, String> {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new(&mut cursor, spec)
+            .map_err(|e| format!("Failed to create WAV writer: {}", e))?;
+
+        for sample in samples {
+            let sample_i16 = (sample * i16::MAX as f32) as i16;
+            writer
+                .write_sample(sample_i16)
+                .map_err(|e| format!("Failed to encode WAV sample: {}", e))?;
+        }
+
+        writer
+            .finalize()
+            .map_err(|e| format!("Failed to finalize WAV data: {}", e))?;
+    }
+    let bytes = cursor.into_inner();
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:audio/wav;base64,{}", base64_data))
 }
 
 #[tauri::command]
@@ -199,9 +230,19 @@ pub async fn get_audio_file_data(
         .resolve_recording_path(&file_name)
         .map_err(|e| e.to_string())?;
 
-    let data = std::fs::read(&path).map_err(|e| format!("Failed to read audio file: {}", e))?;
+    let is_wav = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"));
 
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
-    let mime_type = infer_audio_mime_type(&path);
-    Ok(format!("data:{};base64,{}", mime_type, base64_data))
+    if is_wav {
+        let data = std::fs::read(&path).map_err(|e| format!("Failed to read audio file: {}", e))?;
+        let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+        let mime_type = infer_audio_mime_type(&path);
+        return Ok(format!("data:{};base64,{}", mime_type, base64_data));
+    }
+
+    let samples = crate::audio_toolkit::decode_and_resample(&path)
+        .map_err(|e| format!("Failed to decode audio for playback: {}", e))?;
+    wav_data_url_from_samples(&samples)
 }

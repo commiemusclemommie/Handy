@@ -8,7 +8,6 @@ import React, {
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { readFile } from "@tauri-apps/plugin-fs";
 import {
   Check,
   Copy,
@@ -30,7 +29,6 @@ import {
   type HistoryEntry,
   type HistoryUpdatePayload,
 } from "@/bindings";
-import { useOsType } from "@/hooks/useOsType";
 import { formatDateTime } from "@/utils/dateFormat";
 import { AudioPlayer } from "../../ui/AudioPlayer";
 import { Button } from "../../ui/Button";
@@ -48,34 +46,6 @@ const getErrorMessage = (error: unknown): string =>
 const isImportCancelledError = (error: unknown): boolean =>
   getErrorMessage(error).toLowerCase().includes("cancel");
 
-const inferAudioMimeType = (fileName: string): string => {
-  const extension = fileName.split(".").pop()?.toLowerCase();
-
-  switch (extension) {
-    case "wav":
-      return "audio/wav";
-    case "mp3":
-      return "audio/mpeg";
-    case "m4a":
-    case "mp4":
-    case "m4b":
-      return "audio/mp4";
-    case "aac":
-      return "audio/aac";
-    case "ogg":
-    case "oga":
-      return "audio/ogg";
-    case "flac":
-      return "audio/flac";
-    case "wma":
-      return "audio/x-ms-wma";
-    case "aiff":
-    case "aif":
-      return "audio/aiff";
-    default:
-      return "application/octet-stream";
-  }
-};
 const IconButton: React.FC<{
   onClick: () => void;
   title: string;
@@ -128,7 +98,6 @@ function formatDuration(seconds: number): string {
 
 export const HistorySettings: React.FC = () => {
   const { t } = useTranslation();
-  const osType = useOsType();
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [hasMore, setHasMore] = useState(true);
@@ -349,21 +318,15 @@ export const HistorySettings: React.FC = () => {
 
   const getAudioUrl = useCallback(
     async (fileName: string, forceFallback = false) => {
-      try {
-        const result = await commands.getAudioFilePath(fileName);
-        if (result.status === "ok" && !forceFallback) {
-          return convertFileSrc(result.data, "asset");
+      if (!forceFallback) {
+        try {
+          const result = await commands.getAudioFilePath(fileName);
+          if (result.status === "ok") {
+            return convertFileSrc(result.data, "asset");
+          }
+        } catch (error) {
+          console.warn("Falling back to inline audio loading:", error);
         }
-
-        if (result.status === "ok" && osType === "linux") {
-          const fileData = await readFile(result.data);
-          const blob = new Blob([fileData], {
-            type: inferAudioMimeType(fileName),
-          });
-          return URL.createObjectURL(blob);
-        }
-      } catch (error) {
-        console.warn("Falling back to inline audio loading:", error);
       }
 
       try {
@@ -374,7 +337,7 @@ export const HistorySettings: React.FC = () => {
         return null;
       }
     },
-    [osType],
+    [],
   );
 
   const deleteAudioEntry = async (id: number) => {
