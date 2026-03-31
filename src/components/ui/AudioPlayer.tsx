@@ -30,12 +30,13 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const src = loadedSrc;
   const dragTimeRef = useRef<number>(0);
   const attemptedFallbackRef = useRef(false);
   const desiredPlayingRef = useRef(false);
-  const loadedSrcRef = useRef(loadedSrc);
+  const playbackConfirmedRef = useRef(false);
+  const playWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onLoadRequestRef = useRef(onLoadRequest);
+  const loadedSrcRef = useRef(loadedSrc);
 
   useEffect(() => {
     onLoadRequestRef.current = onLoadRequest;
@@ -45,29 +46,101 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
     loadedSrcRef.current = loadedSrc;
   }, [loadedSrc]);
 
-  const loadSource = useCallback((audio: HTMLAudioElement, newSrc: string) => {
-    if (audio.src === newSrc) {
-      return;
+  const clearPlayWatchdog = useCallback(() => {
+    if (playWatchdogRef.current) {
+      clearTimeout(playWatchdogRef.current);
+      playWatchdogRef.current = null;
     }
-
-    audio.pause();
-    audio.currentTime = 0;
-    setIsPlaying(false);
-    setCurrentTime(0);
-    setDuration(0);
-    setLoadError(null);
-    audio.src = newSrc;
-    audio.load();
   }, []);
+
+  const loadSource = useCallback(
+    (audio: HTMLAudioElement, newSrc: string) => {
+      if (audio.src === newSrc) {
+        return;
+      }
+
+      clearPlayWatchdog();
+      playbackConfirmedRef.current = false;
+      audio.pause();
+      audio.currentTime = 0;
+      setIsPlaying(false);
+      setCurrentTime(0);
+      setDuration(0);
+      setLoadError(null);
+      audio.src = newSrc;
+      audio.load();
+    },
+    [clearPlayWatchdog],
+  );
+
+  const tryFallbackPlayback = useCallback(
+    async (audio: HTMLAudioElement): Promise<boolean> => {
+      const loadRequest = onLoadRequestRef.current;
+      const currentSrc = loadedSrcRef.current || audio.currentSrc || audio.src;
+
+      if (!loadRequest || attemptedFallbackRef.current || !currentSrc) {
+        return false;
+      }
+
+      attemptedFallbackRef.current = true;
+      setIsLoading(true);
+
+      try {
+        const fallbackSrc = await loadRequest(true);
+        if (!fallbackSrc || fallbackSrc === currentSrc) {
+          return false;
+        }
+
+        setLoadedSrc(fallbackSrc);
+        loadSource(audio, fallbackSrc);
+
+        if (desiredPlayingRef.current) {
+          await audio.play();
+        }
+
+        return true;
+      } catch (error) {
+        console.error("Fallback audio load failed:", error);
+        return false;
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [loadSource],
+  );
+
+  const schedulePlayWatchdog = useCallback(
+    (audio: HTMLAudioElement) => {
+      clearPlayWatchdog();
+      playbackConfirmedRef.current = false;
+
+      playWatchdogRef.current = setTimeout(async () => {
+        if (!desiredPlayingRef.current || playbackConfirmedRef.current) {
+          return;
+        }
+
+        const recovered = await tryFallbackPlayback(audio);
+        if (!recovered) {
+          setIsPlaying(false);
+        }
+      }, 1200);
+    },
+    [clearPlayWatchdog, tryFallbackPlayback],
+  );
 
   useEffect(() => {
     const audio = new Audio();
     audio.preload = "metadata";
     audioRef.current = audio;
 
+    const confirmPlayback = () => {
+      playbackConfirmedRef.current = true;
+      clearPlayWatchdog();
+    };
+
     const handleLoadedMetadata = () => {
       setDuration(audio.duration || 0);
-      setCurrentTime(0);
+      setCurrentTime(audio.currentTime || 0);
       setLoadError(null);
     };
 
@@ -84,73 +157,74 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       setLoadError(null);
     };
 
+    const handlePlaying = () => {
+      confirmPlayback();
+      setIsPlaying(true);
+    };
+
+    const handlePlay = () => {
+      setIsPlaying(true);
+    };
+
+    const handlePause = () => {
+      if (!desiredPlayingRef.current) {
+        clearPlayWatchdog();
+      }
+      setIsPlaying(false);
+    };
+
     const handleEnded = () => {
       desiredPlayingRef.current = false;
+      clearPlayWatchdog();
       setIsPlaying(false);
       setCurrentTime(audio.duration || 0);
     };
 
-    const handlePlay = () => setIsPlaying(true);
-    const handlePause = () => setIsPlaying(false);
-
     const handleTimeUpdate = () => {
+      if (audio.currentTime > 0) {
+        confirmPlayback();
+      }
       setCurrentTime(audio.currentTime);
     };
 
     const handleError = async () => {
       console.error("Audio load/play error:", audio.error);
-
-      const loadRequest = onLoadRequestRef.current;
-      const currentSrc = loadedSrcRef.current || audio.currentSrc || audio.src;
-      if (loadRequest && !attemptedFallbackRef.current && currentSrc) {
-        attemptedFallbackRef.current = true;
-        setIsLoading(true);
-
-        try {
-          const fallbackSrc = await loadRequest(true);
-          if (fallbackSrc && fallbackSrc !== currentSrc) {
-            setLoadedSrc(fallbackSrc);
-            loadSource(audio, fallbackSrc);
-
-            if (desiredPlayingRef.current) {
-              await audio.play();
-            }
-            return;
-          }
-        } catch (error) {
-          console.error("Fallback audio load failed:", error);
-        } finally {
-          setIsLoading(false);
-        }
+      const recovered = await tryFallbackPlayback(audio);
+      if (!recovered) {
+        desiredPlayingRef.current = false;
+        clearPlayWatchdog();
+        setIsPlaying(false);
+        setLoadError(audio.error?.message || "Failed to load audio");
       }
-
-      desiredPlayingRef.current = false;
-      setLoadError(audio.error?.message || "Failed to load audio");
     };
 
     audio.addEventListener("loadedmetadata", handleLoadedMetadata);
     audio.addEventListener("durationchange", handleDurationChange);
     audio.addEventListener("canplay", handleCanPlay);
-    audio.addEventListener("ended", handleEnded);
+    audio.addEventListener("playing", handlePlaying);
     audio.addEventListener("play", handlePlay);
     audio.addEventListener("pause", handlePause);
+    audio.addEventListener("ended", handleEnded);
     audio.addEventListener("timeupdate", handleTimeUpdate);
     audio.addEventListener("error", handleError);
 
     return () => {
+      clearPlayWatchdog();
       audio.pause();
       audio.removeEventListener("loadedmetadata", handleLoadedMetadata);
       audio.removeEventListener("durationchange", handleDurationChange);
       audio.removeEventListener("canplay", handleCanPlay);
-      audio.removeEventListener("ended", handleEnded);
+      audio.removeEventListener("playing", handlePlaying);
       audio.removeEventListener("play", handlePlay);
       audio.removeEventListener("pause", handlePause);
+      audio.removeEventListener("ended", handleEnded);
       audio.removeEventListener("timeupdate", handleTimeUpdate);
       audio.removeEventListener("error", handleError);
       audio.src = "";
       audioRef.current = null;
     };
-  }, [loadSource]);
+  }, [clearPlayWatchdog, tryFallbackPlayback]);
+
   useEffect(() => {
     const audio = audioRef.current;
     setLoadedSrc(initialSrc ?? null);
@@ -162,14 +236,17 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
 
     if (initialSrc) {
       loadSource(audio, initialSrc);
+
       if (autoPlay) {
         desiredPlayingRef.current = true;
+        schedulePlayWatchdog(audio);
         audio.play().catch((error) => {
           console.error("Auto-play failed:", error);
         });
       }
     } else {
       desiredPlayingRef.current = false;
+      clearPlayWatchdog();
       audio.pause();
       audio.removeAttribute("src");
       audio.load();
@@ -178,12 +255,20 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       setCurrentTime(0);
       setLoadError(null);
     }
-  }, [autoPlay, initialSrc, loadSource]);
+  }, [
+    autoPlay,
+    clearPlayWatchdog,
+    initialSrc,
+    loadSource,
+    schedulePlayWatchdog,
+  ]);
+
   // Register stop callback for global "only one player at a time"
   const stopPlayback = useCallback(() => {
     desiredPlayingRef.current = false;
+    clearPlayWatchdog();
     audioRef.current?.pause();
-  }, []);
+  }, [clearPlayWatchdog]);
 
   useEffect(() => {
     activePlayers.add(stopPlayback);
@@ -230,37 +315,46 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
     try {
       if (isPlaying) {
         desiredPlayingRef.current = false;
+        clearPlayWatchdog();
         audio.pause();
-      } else if (!src && onLoadRequest) {
+        return;
+      }
+
+      activePlayers.forEach((stop) => {
+        if (stop !== stopPlayback) stop();
+      });
+
+      desiredPlayingRef.current = true;
+      setLoadError(null);
+
+      if (!loadedSrc && onLoadRequest) {
         setIsLoading(true);
-        setLoadError(null);
-        desiredPlayingRef.current = true;
 
         try {
           const newSrc = await onLoadRequest(false);
-          if (newSrc) {
-            attemptedFallbackRef.current = false;
-            setLoadedSrc(newSrc);
-            loadSource(audio, newSrc);
-
-            activePlayers.forEach((stop) => {
-              if (stop !== stopPlayback) stop();
-            });
-
-            await audio.play();
+          if (!newSrc) {
+            desiredPlayingRef.current = false;
+            return;
           }
+
+          attemptedFallbackRef.current = false;
+          setLoadedSrc(newSrc);
+          loadSource(audio, newSrc);
         } finally {
           setIsLoading(false);
         }
-      } else {
-        desiredPlayingRef.current = true;
-        activePlayers.forEach((stop) => {
-          if (stop !== stopPlayback) stop();
-        });
-        await audio.play();
       }
+
+      schedulePlayWatchdog(audio);
+      await audio.play();
     } catch (error) {
       console.error("Playback failed:", error);
+      const recovered = await tryFallbackPlayback(audio);
+      if (!recovered) {
+        desiredPlayingRef.current = false;
+        clearPlayWatchdog();
+        setIsPlaying(false);
+      }
     }
   };
 

@@ -29,7 +29,6 @@ import {
   type HistoryEntry,
   type HistoryUpdatePayload,
 } from "@/bindings";
-import { useOsType } from "@/hooks/useOsType";
 import { formatDateTime } from "@/utils/dateFormat";
 import { AudioPlayer } from "../../ui/AudioPlayer";
 import { Button } from "../../ui/Button";
@@ -99,7 +98,6 @@ function formatDuration(seconds: number): string {
 
 export const HistorySettings: React.FC = () => {
   const { t } = useTranslation();
-  const osType = useOsType();
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [hasMore, setHasMore] = useState(true);
@@ -320,7 +318,7 @@ export const HistorySettings: React.FC = () => {
 
   const getAudioUrl = useCallback(
     async (fileName: string, forceFallback = false) => {
-      if (!forceFallback && osType !== "linux") {
+      if (!forceFallback) {
         try {
           const result = await commands.getAudioFilePath(fileName);
           if (result.status === "ok") {
@@ -333,13 +331,28 @@ export const HistorySettings: React.FC = () => {
 
       try {
         const fallback = await commands.getAudioFileData(fileName);
-        return fallback.status === "ok" ? fallback.data : null;
+        if (fallback.status !== "ok") {
+          return null;
+        }
+
+        if (!fallback.data.startsWith("data:")) {
+          return fallback.data;
+        }
+
+        try {
+          const response = await fetch(fallback.data);
+          const blob = await response.blob();
+          return URL.createObjectURL(blob);
+        } catch (error) {
+          console.warn("Failed to convert inline audio to blob URL:", error);
+          return fallback.data;
+        }
       } catch (error) {
         console.error("Failed to load audio file:", error);
         return null;
       }
     },
-    [osType],
+    [],
   );
 
   const deleteAudioEntry = async (id: number) => {
