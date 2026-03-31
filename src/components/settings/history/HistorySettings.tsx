@@ -657,15 +657,38 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   retryTranscription,
 }) => {
   const { t, i18n } = useTranslation();
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [showCopied, setShowCopied] = useState(false);
   const [retrying, setRetrying] = useState(false);
 
   const hasTranscription = entry.transcription_text.trim().length > 0;
 
-  const handleLoadAudio = useCallback(
-    () => getAudioUrl(entry.file_name),
-    [getAudioUrl, entry.file_name],
-  );
+  useEffect(() => {
+    let cancelled = false;
+    let nextUrl: string | null = null;
+
+    const loadAudio = async () => {
+      const url = await getAudioUrl(entry.file_name);
+      if (cancelled) {
+        if (url?.startsWith("blob:")) {
+          URL.revokeObjectURL(url);
+        }
+        return;
+      }
+
+      nextUrl = url;
+      setAudioUrl(url);
+    };
+
+    loadAudio();
+
+    return () => {
+      cancelled = true;
+      if (nextUrl?.startsWith("blob:")) {
+        URL.revokeObjectURL(nextUrl);
+      }
+    };
+  }, [entry.file_name, getAudioUrl]);
 
   const handleCopyText = () => {
     if (!hasTranscription) {
@@ -805,7 +828,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
             : t("settings.history.transcriptionFailed")}
       </p>
 
-      <AudioPlayer onLoadRequest={handleLoadAudio} className="w-full" />
+      <AudioPlayer src={audioUrl} className="w-full" />
     </div>
   );
 };
