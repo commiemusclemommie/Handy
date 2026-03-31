@@ -29,6 +29,7 @@ import {
   type HistoryEntry,
   type HistoryUpdatePayload,
 } from "@/bindings";
+import { useOsType } from "@/hooks/useOsType";
 import { formatDateTime } from "@/utils/dateFormat";
 import { AudioPlayer } from "../../ui/AudioPlayer";
 import { Button } from "../../ui/Button";
@@ -98,6 +99,7 @@ function formatDuration(seconds: number): string {
 
 export const HistorySettings: React.FC = () => {
   const { t } = useTranslation();
+  const osType = useOsType();
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [hasMore, setHasMore] = useState(true);
@@ -318,7 +320,7 @@ export const HistorySettings: React.FC = () => {
 
   const getAudioUrl = useCallback(
     async (fileName: string, forceFallback = false) => {
-      if (!forceFallback) {
+      if (!forceFallback && osType !== "linux") {
         try {
           const result = await commands.getAudioFilePath(fileName);
           if (result.status === "ok") {
@@ -352,7 +354,7 @@ export const HistorySettings: React.FC = () => {
         return null;
       }
     },
-    [],
+    [osType],
   );
 
   const deleteAudioEntry = async (id: number) => {
