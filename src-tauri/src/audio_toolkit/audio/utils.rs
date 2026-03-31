@@ -238,9 +238,6 @@ pub fn decode_and_resample<P: AsRef<Path>>(path: P) -> Result<Vec<f32>, String> 
                         samples.push(sum / ch as f32);
                     }
                 }
-                _ => {
-                    log::warn!("Unsupported sample format in audio buffer");
-                }
             },
             Err(SymphoniaError::DecodeError(e)) => {
                 // Recoverable decode error — log and continue.
