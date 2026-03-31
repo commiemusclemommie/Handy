@@ -8,6 +8,7 @@ import React, {
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { readFile } from "@tauri-apps/plugin-fs";
 import {
   Check,
   Copy,
@@ -319,16 +320,22 @@ export const HistorySettings: React.FC = () => {
   };
 
   const getAudioUrl = useCallback(
-    async (fileName: string, forceFallback = false) => {
-      if (!forceFallback && osType !== "linux") {
-        try {
-          const result = await commands.getAudioFilePath(fileName);
-          if (result.status === "ok") {
+    async (fileName: string) => {
+      try {
+        const result = await commands.getAudioFilePath(fileName);
+        if (result.status === "ok") {
+          if (osType === "linux") {
+            if (fileName.toLowerCase().endsWith(".wav")) {
+              const fileData = await readFile(result.data);
+              const blob = new Blob([fileData], { type: "audio/wav" });
+              return URL.createObjectURL(blob);
+            }
+          } else {
             return convertFileSrc(result.data, "asset");
           }
-        } catch (error) {
-          console.warn("Falling back to inline audio loading:", error);
         }
+      } catch (error) {
+        console.warn("Falling back to data URL audio loading:", error);
       }
 
       try {
@@ -341,14 +348,9 @@ export const HistorySettings: React.FC = () => {
           return fallback.data;
         }
 
-        try {
-          const response = await fetch(fallback.data);
-          const blob = await response.blob();
-          return URL.createObjectURL(blob);
-        } catch (error) {
-          console.warn("Failed to convert inline audio to blob URL:", error);
-          return fallback.data;
-        }
+        const response = await fetch(fallback.data);
+        const blob = await response.blob();
+        return URL.createObjectURL(blob);
       } catch (error) {
         console.error("Failed to load audio file:", error);
         return null;
@@ -641,10 +643,7 @@ interface HistoryEntryProps {
   entry: HistoryEntry;
   onToggleSaved: () => void;
   onCopyText: () => void;
-  getAudioUrl: (
-    fileName: string,
-    forceFallback?: boolean,
-  ) => Promise<string | null>;
+  getAudioUrl: (fileName: string) => Promise<string | null>;
   deleteAudio: (id: number) => Promise<void>;
   retryTranscription: (id: number) => Promise<void>;
 }
@@ -664,7 +663,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   const hasTranscription = entry.transcription_text.trim().length > 0;
 
   const handleLoadAudio = useCallback(
-    (forceFallback?: boolean) => getAudioUrl(entry.file_name, forceFallback),
+    () => getAudioUrl(entry.file_name),
     [getAudioUrl, entry.file_name],
   );
 
