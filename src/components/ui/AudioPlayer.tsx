@@ -7,8 +7,10 @@ const activePlayers = new Set<() => void>();
 interface AudioPlayerProps {
   /** Audio source URL. If not provided, onLoadRequest must be provided. */
   src?: string;
-  /** Called when play is clicked and no src is loaded yet. Should return the audio URL. */
-  onLoadRequest?: () => Promise<string | null>;
+  /** Called when play is clicked and no src is loaded yet. If fallback is true,
+   * the caller should prefer an inline/data-based fallback source.
+   */
+  onLoadRequest?: (fallback?: boolean) => Promise<string | null>;
   className?: string;
   autoPlay?: boolean;
 }
@@ -30,9 +32,11 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const src = loadedSrc;
   const dragTimeRef = useRef<number>(0);
+  const attemptedFallbackRef = useRef(false);
 
   useEffect(() => {
     setLoadedSrc(initialSrc ?? null);
+    attemptedFallbackRef.current = false;
   }, [initialSrc]);
 
   // Create audio element imperatively (not in JSX) so ref is always stable
@@ -75,8 +79,27 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       setCurrentTime(audio.currentTime);
     };
 
-    const handleError = () => {
+    const handleError = async () => {
       console.error("Audio load error:", audio.error);
+
+      if (onLoadRequest && !attemptedFallbackRef.current && src) {
+        attemptedFallbackRef.current = true;
+        setIsLoading(true);
+
+        try {
+          const fallbackSrc = await onLoadRequest(true);
+          if (fallbackSrc && fallbackSrc !== src) {
+            setLoadError(null);
+            setLoadedSrc(fallbackSrc);
+            return;
+          }
+        } catch (error) {
+          console.error("Fallback audio load failed:", error);
+        } finally {
+          setIsLoading(false);
+        }
+      }
+
       setLoadError(audio.error?.message || "Failed to load audio");
     };
 
@@ -189,8 +212,9 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
         setLoadError(null);
 
         try {
-          const newSrc = await onLoadRequest();
+          const newSrc = await onLoadRequest(false);
           if (newSrc) {
+            attemptedFallbackRef.current = false;
             setLoadedSrc(newSrc);
             // Playback will be triggered by the useEffect watching loadedSrc.
           }

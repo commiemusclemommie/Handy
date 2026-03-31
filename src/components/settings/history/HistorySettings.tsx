@@ -48,6 +48,34 @@ const getErrorMessage = (error: unknown): string =>
 const isImportCancelledError = (error: unknown): boolean =>
   getErrorMessage(error).toLowerCase().includes("cancel");
 
+const inferAudioMimeType = (fileName: string): string => {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+
+  switch (extension) {
+    case "wav":
+      return "audio/wav";
+    case "mp3":
+      return "audio/mpeg";
+    case "m4a":
+    case "mp4":
+    case "m4b":
+      return "audio/mp4";
+    case "aac":
+      return "audio/aac";
+    case "ogg":
+    case "oga":
+      return "audio/ogg";
+    case "flac":
+      return "audio/flac";
+    case "wma":
+      return "audio/x-ms-wma";
+    case "aiff":
+    case "aif":
+      return "audio/aiff";
+    default:
+      return "application/octet-stream";
+  }
+};
 const IconButton: React.FC<{
   onClick: () => void;
   title: string;
@@ -320,20 +348,22 @@ export const HistorySettings: React.FC = () => {
   };
 
   const getAudioUrl = useCallback(
-    async (fileName: string) => {
+    async (fileName: string, forceFallback = false) => {
       try {
         const result = await commands.getAudioFilePath(fileName);
-        if (result.status === "ok") {
-          if (osType === "linux") {
-            const fileData = await readFile(result.data);
-            const blob = new Blob([fileData], { type: "audio/wav" });
-            return URL.createObjectURL(blob);
-          }
-
+        if (result.status === "ok" && !forceFallback) {
           return convertFileSrc(result.data, "asset");
         }
+
+        if (result.status === "ok" && osType === "linux") {
+          const fileData = await readFile(result.data);
+          const blob = new Blob([fileData], {
+            type: inferAudioMimeType(fileName),
+          });
+          return URL.createObjectURL(blob);
+        }
       } catch (error) {
-        console.warn("Falling back to data URL audio loading:", error);
+        console.warn("Falling back to inline audio loading:", error);
       }
 
       try {
@@ -631,7 +661,10 @@ interface HistoryEntryProps {
   entry: HistoryEntry;
   onToggleSaved: () => void;
   onCopyText: () => void;
-  getAudioUrl: (fileName: string) => Promise<string | null>;
+  getAudioUrl: (
+    fileName: string,
+    forceFallback?: boolean,
+  ) => Promise<string | null>;
   deleteAudio: (id: number) => Promise<void>;
   retryTranscription: (id: number) => Promise<void>;
 }
@@ -651,7 +684,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   const hasTranscription = entry.transcription_text.trim().length > 0;
 
   const handleLoadAudio = useCallback(
-    () => getAudioUrl(entry.file_name),
+    (forceFallback?: boolean) => getAudioUrl(entry.file_name, forceFallback),
     [getAudioUrl, entry.file_name],
   );
 

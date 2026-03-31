@@ -516,6 +516,22 @@ pub fn run(cli_args: CliArgs) {
         .setup(move |app| {
             specta_builder.mount_events(app);
 
+            let mut settings = get_settings(&app.handle());
+
+            // CLI --debug flag overrides debug_mode and log level (runtime-only, not persisted)
+            if cli_args.debug {
+                settings.debug_mode = true;
+                settings.log_level = settings::LogLevel::Trace;
+            }
+
+            let should_hide = settings.start_hidden || cli_args.start_hidden;
+            let tray_available = settings.show_tray_icon && !cli_args.no_tray;
+
+            #[cfg(target_os = "windows")]
+            let initially_visible = false;
+            #[cfg(not(target_os = "windows"))]
+            let initially_visible = !should_hide || !tray_available;
+
             // Create main window programmatically so we can set data_directory
             // for portable mode (redirects WebView2 cache to portable Data dir)
             let mut win_builder =
@@ -525,21 +541,13 @@ pub fn run(cli_args: CliArgs) {
                     .min_inner_size(680.0, 570.0)
                     .resizable(true)
                     .maximizable(false)
-                    .visible(false);
+                    .visible(initially_visible);
 
             if let Some(data_dir) = portable::data_dir() {
                 win_builder = win_builder.data_directory(data_dir.join("webview"));
             }
 
             win_builder.build()?;
-
-            let mut settings = get_settings(&app.handle());
-
-            // CLI --debug flag overrides debug_mode and log level (runtime-only, not persisted)
-            if cli_args.debug {
-                settings.debug_mode = true;
-                settings.log_level = settings::LogLevel::Trace;
-            }
 
             let tauri_log_level: tauri_plugin_log::LogLevel = settings.log_level.into();
             let file_log_level: log::Level = tauri_log_level.into();
@@ -558,14 +566,21 @@ pub fn run(cli_args: CliArgs) {
             // Show main window only if not starting hidden.
             // CLI --start-hidden flag overrides the setting.
             // But if permission onboarding is required, always show the window.
-            let should_hide = settings.start_hidden || cli_args.start_hidden;
             let should_force_show = should_force_show_permissions_window(&app_handle);
 
             // If start_hidden but tray is disabled, we must show the window
             // anyway. Without a tray icon, the dock is the only way back in.
-            let tray_available = settings.show_tray_icon && !cli_args.no_tray;
-            if should_force_show || !should_hide || !tray_available {
+            if should_force_show
+                || (!should_hide && !initially_visible)
+                || (!tray_available && !initially_visible)
+            {
                 show_main_window(&app_handle);
+            } else if initially_visible {
+                if let Some(main_window) = app_handle.get_webview_window("main") {
+                    if let Err(e) = main_window.set_focus() {
+                        log::error!("Failed to focus webview window: {}", e);
+                    }
+                }
             }
 
             Ok(())

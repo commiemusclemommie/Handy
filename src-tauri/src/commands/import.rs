@@ -1,4 +1,5 @@
 use crate::audio_toolkit::audio::decode_and_resample;
+#[cfg(test)]
 use crate::audio_toolkit::save_wav_file;
 use crate::audio_toolkit::vad::{SileroVad, VoiceActivityDetector};
 use crate::managers::history::HistoryManager;
@@ -586,11 +587,17 @@ pub async fn import_audio_file(
         message
     })?;
 
-    let file_name = format!("handy-import-{}.wav", import_id);
+    let file_extension = source_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty() && ext.chars().all(|ch| ch.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| "audio".to_string());
+    let file_name = format!("handy-import-{}.{}", import_id, file_extension);
     let target_path = recordings_dir.join(&file_name);
 
-    save_wav_file(&target_path, &samples).map_err(|e| {
-        let message = format!("Failed to save audio: {}", e);
+    fs::copy(&source_path, &target_path).map_err(|e| {
+        let message = format!("Failed to save imported audio: {}", e);
         emit_progress(&app_handle, "failed", 0, &message);
         message
     })?;

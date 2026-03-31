@@ -4,6 +4,7 @@ use crate::managers::{
     transcription::TranscriptionManager,
 };
 use base64::Engine;
+use std::path::Path;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 
@@ -61,6 +62,25 @@ pub async fn delete_history_entry(
         .map_err(|e| e.to_string())
 }
 
+fn infer_audio_mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("wav") => "audio/wav",
+        Some("mp3") => "audio/mpeg",
+        Some("m4a") | Some("mp4") | Some("m4b") => "audio/mp4",
+        Some("aac") => "audio/aac",
+        Some("ogg") | Some("oga") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        Some("wma") => "audio/x-ms-wma",
+        Some("aiff") | Some("aif") => "audio/aiff",
+        _ => "application/octet-stream",
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn retry_history_entry_transcription(
@@ -78,8 +98,17 @@ pub async fn retry_history_entry_transcription(
     let audio_path = history_manager
         .resolve_recording_path(&entry.file_name)
         .map_err(|e| e.to_string())?;
-    let samples = crate::audio_toolkit::read_wav_samples(&audio_path)
-        .map_err(|e| format!("Failed to load audio: {}", e))?;
+    let samples = if audio_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+    {
+        crate::audio_toolkit::read_wav_samples(&audio_path)
+            .map_err(|e| format!("Failed to load audio: {}", e))?
+    } else {
+        crate::audio_toolkit::decode_and_resample(&audio_path)
+            .map_err(|e| format!("Failed to decode audio: {}", e))?
+    };
 
     if samples.is_empty() {
         return Err("Recording has no audio samples".to_string());
@@ -173,5 +202,6 @@ pub async fn get_audio_file_data(
     let data = std::fs::read(&path).map_err(|e| format!("Failed to read audio file: {}", e))?;
 
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
-    Ok(format!("data:audio/wav;base64,{}", base64_data))
+    let mime_type = infer_audio_mime_type(&path);
+    Ok(format!("data:{};base64,{}", mime_type, base64_data))
 }
